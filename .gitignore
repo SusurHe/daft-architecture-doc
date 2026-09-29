@@ -1,0 +1,16 @@
+# Python / 构建产物
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 文档构建与预览的中间产物
+preview/
+preview-*.png
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+# 统一换行符：仓库内一律使用 LF，避免 Windows 下产生 CRLF 噪音
+* text=auto eol=lf
+
+# 二进制/生成物不做换行转换
+*.html text eol=lf
+*.svg  text eol=lf
+*.png  binary
+*.pdf  binary

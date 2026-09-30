@@ -10,7 +10,7 @@
 |---|---|---|---|
 | **P0** | 契约层（能力/类型映射/写形态/提交协议）、注册表、内置 provider、统一 handle、选项契约、残余协商 | ✅ 完成 | `a6faef98`、`f529e910`、`0cf89f64`；47 用例 |
 | **P1-a** | 公开入口：导出 `daft.open` / `daft.storage` | ✅ 完成 | `280f0ae6`；50 用例 |
-| **P1-b** | 内置读入口（parquet/csv/json/avro/text）改为 `STORAGE × FORMAT` 两次解析 | ⏳ 待做 | — |
+| **P1-b** | 读入口双轴解析 —— **试点 `read_parquet`** 已落地（其余 reader 待办） | ✅ 完成 | `a1459e03`；78 用例 + 计划对拍 |
 | **P1-c** | 内置写入口改为 `handle.sink()` → `NativeTabularSink` | ⏳ 待做 | — |
 | **P2** | 数据湖 provider：Iceberg 复用 parquet 的 FORMAT 实现 + 自身元数据逻辑 | ⏳ 待做 | — |
 | **P0.5** | 一致性套件（capability 诚实性、选项契约、协商不丢项、类型映射自洽） | ✅ 完成 | `68ec1c27`；74 用例 |
@@ -138,6 +138,40 @@ ruff check / format --check # 全绿
 内置 provider（parquet / csv / clickhouse）全部通过；测试里另有 4 个"故意违规"的 provider 用于证明检查会真的报错。
 
 
+### P1-b · 读入口双轴解析（试点 `read_parquet`，完成）
+
+**提交**：`a1459e03` — `feat(storage): resolve read_parquet's storage and format axes through the provider layer`
+
+**变更**
+
+- 新增 `daft/storage/legacy.py`：`tabular_scan_configs()` —— provider 层负责"谁参与 + 谁产出配置"，
+  返回与改动前**完全相同**的 `(FileFormatConfig, StorageConfig)`；
+- `ParquetFormatProvider.legacy_file_format_config()`：**选项 → reader 配置的映射收敛到 provider**（格式的能力声明与读取配置现在放在一起）；
+- 文件系统 provider 增加 `io_config()`：存储轴真正参与解析结果，而不是只被查表；
+- `daft/io/_parquet.py`：两个配置对象改由 provider 层构造。
+
+**验证方法（关键）**
+
+本 checkout 无法完成本地构建（见下"环境与阻塞"），但发现 `daft/io/_parquet.py` 与 PyPI `daft==0.7.25`
+**逐字节相同**（忽略换行符），因此可以在 0.7.25 运行时上做**严格对拍**：
+
+1. 固定同一份数据目录（避免 UUID 文件名与路径污染计划文本）；
+2. 捕获 3 个用例的**未优化计划 + 优化计划 + 物理计划 + 数据结果**作为基线；
+3. 应用补丁后重新捕获；
+4. `diff -r` 比较 → **逐字节一致**。
+
+```bash
+python /d/DOC/daft-patch/verify_p1b.py /tmp/p1b_before /tmp/p1b_data   # 基线
+python /d/DOC/daft-patch/patch_p1b1.py                                # 应用补丁
+python /d/DOC/daft-patch/verify_p1b.py /tmp/p1b_after  /tmp/p1b_data   # 打补丁后
+diff -r /tmp/p1b_before /tmp/p1b_after                                 # 无差异
+pytest tests/storage -q                                                # 78 passed
+```
+
+**说明**：对拍用的是 0.7.25 的编译扩展（仓库无法本地构建），但被修改的文件在两处完全一致，
+因此该对拍能有效证明"本次改动不改变行为"；完整的 `tests/io/**` 回归仍需在可构建环境（CI）执行。
+
+
 ---
 
 ## 环境与阻塞
@@ -148,6 +182,7 @@ ruff check / format --check # 全绿
 | 可用运行时 | PyPI `daft==0.7.25`（有 Windows wheel）；nightly 索引无 win 产物 | 本地验证方式：把 `daft/storage/` 覆盖进 0.7.25 运行时的 site-packages，并把 `daft.open` 导出补丁同步到已安装包，然后跑 `tests/storage` |
 | 结论 | 新层只依赖稳定公开 API（`read_parquet`/`read_csv`/`write_*`/`DataFrame.where/select/limit/offset`） | 在标准构建环境可直接 `pytest tests/storage -q`；但 **P1-b/P1-c 改的是现有入口，必须先能本机构建**，否则无法用 `tests/io/**` 做逐字等价回归 |
 | 网络 | 该链路对 SSH 压缩不友好，大包推送会 `send-pack: unexpected disconnect` | 仓库本地已配置 `core.sshCommand "ssh -o Compression=no -o ServerAliveInterval=15"`；必要时按提交逐个推送 |
+| Windows 构建（**未解决**） | ① `maturin develop` 因 Windows 文件锁失败（已改用 `maturin build`）；② GNU ABI 工具链缺 `dlltool`（已用 MSYS2 pacman 装 binutils+gcc）；③ 16GB 内存下并行编译 OOM，产生 `std`/rmeta 伪错误（已降并行 + 关 debuginfo）；④ **`tikv-jemalloc-sys` 在 windows-gnu 上产出 `jemalloc_s.lib` 而 rustc 找 `libjemalloc.a`**，属第三方 crate 打包缺陷 | 本机无 MSVC（`cl.exe` 不存在），否则 MSVC 目标会因 `cfg(not(target_env = "msvc"))` 直接跳过 jemalloc。备选：装 VS Build Tools（约 4GB）或改由 GitHub Actions 验证 |
 
 ## 推送与链接
 

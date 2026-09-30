@@ -298,6 +298,38 @@ L0  Filesystem（字节存取）     scheme → FS 实现（local / s3 / **oss**
 - Location-backed 表（Hive / 数据湖）：L3 解析出的表**携带 location + file format + table protocol**，于是才会向下拉 L2→L1→L0；
 - 路径式访问（`read_parquet("s3://…")`）：没有 L3，直接 L0→L1。
 
+#### 3.7.1 但"需要 location" ≠ "用户需要指定 location"（v3 补充）
+
+Iceberg 是最典型的边界案例：**它必然有 location**（目录式表：数据文件 + `metadata.json` + manifest 都在文件系统上），
+所以 L0/L1/L2 必然参与；但**谁来指定这个路径**是三态可变的，Daft 两种接入都已实现：
+
+| location 来源 | 典型场景 | 用户是否给路径 | Daft 现状证据 |
+|---|---|---|---|
+| `LOCATION_USER` | 直接读 `metadata.json`（Hadoop 表）、`write_parquet("s3://…")`、`CREATE TABLE … LOCATION` | **是** | `StaticTable.from_metadata(metadata_location=...)`（`daft/io/iceberg/_iceberg.py:186`） |
+| `LOCATION_CATALOG` | HMS / Glue / Unity / REST / SQL catalog 里的 Iceberg/Paimon/Hive 表 | **否**（catalog 或 warehouse 配置给） | `IcebergCatalog._load_catalog(name, **options)` → pyiceberg `load_catalog`，选项全部透传（`daft/catalog/__iceberg.py:64-67`）；写侧 `write_iceberg(table: pyiceberg.table.Table, …)` 收的是**表对象**，路径已被解析（`dataframe.py:1403-1412`） |
+| `LOCATION_NONE` | Postgres / ClickHouse / MongoDB、纯注册表（`TableSource::View`） | 不适用 | `PostgresCatalog` 只持连接串（`__postgres.py:38`） |
+
+**还有第二层来源：凭据。** Iceberg REST 的 `loadTable` 会在响应中下发文件系统配置（如 S3 凭据、endpoint），
+因此即使 location 由 catalog 给出，**FS 凭据也可能由 catalog 下发**。Daft 的语义已经写死在文档字符串里：
+
+> `read_iceberg(..., io_config=...)`：*"If provided, configurations set in `table` are ignored."*（`daft/io/iceberg/_iceberg.py:151`）
+
+即 **显式 `IOConfig` 覆盖表/catalog 下发的配置**。设计里必须把这条优先级固定下来，否则会出现"目录下发的临时凭据"与"本地静态凭据"互相打架：
+
+```
+凭据解析优先级：显式 IOConfig  >  catalog / 表下发（credential vending）  >  环境与默认链
+```
+
+**修正后的判据（取代上一节的粗粒度说法）：**
+
+> 1. **"后端是否需要 location"** 决定层链长度 —— DB 类在 L3 终止，文件/数据湖类向下拉 L0/L1/L2；
+> 2. **"location 由谁给"** 决定配置来源 —— 用户参数 vs catalog 元数据 vs warehouse 配置；
+> 3. 两者**不可混为一谈**：Iceberg 属于"必须有 location、但通常不由用户指定"。
+>
+> 相应地，`TableRef.location` 应当是"**解析后的结果**"，并额外带上 `location_source: LOCATION_USER | LOCATION_CATALOG | LOCATION_NONE`，
+> 这样 `handle.explain()` 能明确回答"这次读的路径是谁给的、凭据从哪来"。
+
+
 **Daft 现状已经部分符合这个分层，不需要新造轮子：**
 
 | 层 | 现状承载者 | 证据 | 缺口 |
@@ -671,3 +703,4 @@ L3 Catalog（命名）  catalog > schema > table
 | v1 | 初版：Provider/Capabilities/TypeMapping/Handle + 单一 scheme 注册表；`sink()` 返回 `DataSink` |
 | **v2** | 修正为**双轴模型**（STORAGE × FORMAT + LAKE/TABLE/VIRTUAL），新增 `SinkSpec` 三种写形态、内置后端能力矩阵（§7.6）、能力 meet 组合规则、URI 解析规则；P1 改为"用内置文件后端验证双轴模型" |
 | **v3** | 再把"双轴"收敛为**四层模型**（§3.7）：L0 Filesystem / L1 FileFormat / L2 TableFormat / L3 Catalog，四者**相互独立**；`location` 改为**可选字段**，只有 location-backed 的 catalog 才向下拉 L0/L1/L2；DB-backed 与纯注册表在 L3 终止；写路径按"谁拥有文件"分派（Daft 写 vs DB 写）；`TableRef` 增加 `location/file_format/table_protocol/layers` |
+| **v3.1** | 补充 §3.7.1：区分"**表需要 location**"与"**用户需要指定 location**"——`location_source` 三态（USER / CATALOG / NONE），并用 Iceberg 的两种接入（`StaticTable.from_metadata` vs pyiceberg `load_catalog`）作为实证；新增**凭据来源优先级**（显式 IOConfig > catalog 下发 > 环境链），依据 `read_iceberg` 文档字符串 |

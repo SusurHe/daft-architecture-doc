@@ -13,6 +13,7 @@
 | **P1-b** | 内置读入口（parquet/csv/json/avro/text）改为 `STORAGE × FORMAT` 两次解析 | ⏳ 待做 | — |
 | **P1-c** | 内置写入口改为 `handle.sink()` → `NativeTabularSink` | ⏳ 待做 | — |
 | **P2** | 数据湖 provider：Iceberg 复用 parquet 的 FORMAT 实现 + 自身元数据逻辑 | ⏳ 待做 | — |
+| **P0.5** | 一致性套件（capability 诚实性、选项契约、协商不丢项、类型映射自洽） | ✅ 完成 | `68ec1c27`；74 用例 |
 | **P3-a** | ClickHouse provider（读 `read_sql` / 写既有 sink / `APPEND_ONLY` 声明）+ DB 类 URI 在 L3 终止 | ✅ 完成 | `32c76b3b`；66 用例 |
 | **P3-b** | MongoDB provider、修 `PostgresCatalog.append` 的内联 COPY、`DataWriter/Committer` 接入执行层 | ⏳ 待做 | — |
 | **P4** | 收敛：新后端只接受 provider 形式、`write_*` 弃用、能力矩阵文档自动化 | ⏳ 待做 | — |
@@ -109,6 +110,32 @@ ruff format --check ...                    # 全绿
 | 5 | sink 构造缺 `host` 参数 | 即使 URI 里带 host 也会 `TypeError` | 从 URI 解析连接参数，选项优先，并在导入可选驱动**之前**校验 |
 | 6 | 表名与 database 重复限定 | `insert_df(table="analytics.events", database="analytics")` 语义不确定 | sink 传裸表名 + database；SQL 查询侧才用 `database.table` |
 | 7 | 缺省依赖提示测试与实现冲突 | 注册 ClickHouse 后旧用例仍断言"未注册" | 该用例改用仍未注册的 `iceberg://` scheme |
+
+
+### P0.5 · 一致性套件（完成）
+
+**提交**：`68ec1c27` — `feat(storage): add a conformance kit for third party providers`
+
+**目的**：把设计里"声明必须是事实来源"从口头规约变成**机器可检查**：第三方 provider 可以在自己的 CI 里跑同一套检查。
+
+**内容**（`daft/storage/conformance.py` + 8 个用例）
+
+| 检查 | 断言 |
+|---|---|
+| 身份 | `info.name`/`keys` 非空、key 唯一且小写 |
+| 选项契约 | 无重复声明、每个选项必须有 doc |
+| 能力诚实性 | 声明 `BATCH_WRITE` ⇒ 必须有 `write_protocol` 且实现 `sink()`；声明 `BATCH_READ` ⇒ 必须实现 `scan()`（V1 fallback 除外） |
+| 类型映射自洽 | 支持值必须是 `DTypeSupport`；出现 `SERIALIZE` 时不得声明 `non_primitive="error"` |
+| 协商契约 | 一轮协商**不得丢项**（`accounts_for_all`）；实现了 `push_projection` 就必须记录列 |
+
+**验证**
+
+```bash
+pytest tests/storage -q     # 74 passed
+ruff check / format --check # 全绿
+```
+
+内置 provider（parquet / csv / clickhouse）全部通过；测试里另有 4 个"故意违规"的 provider 用于证明检查会真的报错。
 
 
 ---

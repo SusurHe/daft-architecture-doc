@@ -223,6 +223,9 @@ class StorageHandle:
 
 ### 3.6 双轴模型：内置格式与数据湖如何纳入（v2 新增，修正 v1 的模型错误）
 
+> **v3 边界说明**：本节描述的 `STORAGE × FORMAT` 是**文件 / 数据湖族**的解析路径，**不适用于 DB 类后端**
+> （ClickHouse/Postgres 等既无 scheme 也无文件格式，数据文件由数据库自己管理）。完整的四层模型与"location 只在需要时引入"的规则见 §3.7。
+
 **v1 的错误**：把 `parquet/csv/iceberg` 当成"和 `clickhouse` 一样的 scheme 型后端"。实际上内置路径是**两个独立参数的组合**：
 
 | 轴 | 承载者 | 证据 |
@@ -272,6 +275,74 @@ URI ──► [STORAGE provider]   key = scheme（local / s3 / gs / az / http / 
 但 Parquet 的谓词/列下推实际是生效的——因为下推走 `Pushdowns` 通道，只有 limit 真正检查了 `can_absorb_limit()`
 （`push_down_limit.rs:134`），而 `can_absorb_filter/select` 目前仅用于 Python scan operator 桥接
 （`src/daft-scan/src/python.rs:527-594`）。v2 要求**把"声明"变成唯一事实来源**：声明为 true 就必须真的下推（由 §6.1 的一致性测试断言）。
+
+### 3.7 四层模型（v3）：FS / 文件格式 / 表格式 / Catalog，location 只在需要时引入
+
+v2 把"存储 × 格式"说成了通用解析流水线，这会把 DB 类后端错误地也套进文件体系。正确的划分是**四个相互独立的层**，
+依赖关系**只在"需要 location"的那一支向上拉**（与 Spark / Flink 的分层一致）：
+
+```
+L3  Catalog（命名解析）        catalog > database/schema > table
+      ├── 纯注册表：无 location、无连接（Daft 现状：TableSource::View(LogicalPlan)，table.rs:14-21）
+      ├── DB-backed：只持连接串；数据文件由数据库自己管理（Postgres/ClickHouse/MongoDB…）
+      └── Location-backed：持 warehouse / LOCATION 根 → **需要 L0/L1/L2**（Hive/Iceberg/Paimon/Glue/Unity/Tables）
+L2  Table format（表协议）     快照 · 清单 · 分区规范 · 提交协议（Iceberg/Delta/Hudi/Paimon/Lance）
+L1  File format（字节编码）    Parquet / CSV / JSON / Avro / Text / MCAP / WARC
+L0  Filesystem（字节存取）     scheme → FS 实现（local / s3 / **oss** / hdfs / gcs / az / http / hf + OpenDAL）
+```
+
+**关键结论：`location` 是"可选字段"，不是"必经之路"。**
+
+- DB-backed 表：解析在 L3 就结束，**不涉及 L0/L1/L2**；写数据也交给数据库自己的存储引擎（事务、WAL、compaction 都是它的事），
+  Daft 只负责"把 Arrow 批次交出去 + 处理提交语义"——这正是 `SinkSpec::PythonDataSink` / `CatalogSink` 的职责；
+- Location-backed 表（Hive / 数据湖）：L3 解析出的表**携带 location + file format + table protocol**，于是才会向下拉 L2→L1→L0；
+- 路径式访问（`read_parquet("s3://…")`）：没有 L3，直接 L0→L1。
+
+**Daft 现状已经部分符合这个分层，不需要新造轮子：**
+
+| 层 | 现状承载者 | 证据 | 缺口 |
+|---|---|---|---|
+| L0 Filesystem | `IOConfig` 按 scheme 分区 + `opendal_backends: BTreeMap<scheme, kv>` + **`protocol_aliases`（自定义 scheme → 已有 scheme）** | `src/common/io-config/src/config.rs:12-32`；`SourceType` 9 种（`src/daft-io/src/lib.rs:517-527`） | scheme 能力未声明化（range/multipart/并发上限只在实现里）；第三方加 FS 需改 Rust 枚举 |
+| L1 File format | `FileFormatConfig::{Parquet, Csv, Json, Warc, Text, Avro, Mcap}` | `src/daft-scan/src/file_format_config.rs:21-29` | 能力未声明化（§3.6 末尾的 `can_absorb_*` 不一致问题） |
+| L2 Table format | Iceberg/Delta/Hudi/Paimon/Lance 的 Python `DataSource` + `daft-writers` | `daft/io/iceberg/_iceberg.py:183-200` | 未声明"我需要 FS+FileFormat"这一依赖 |
+| L3 Catalog | `Catalog`/`Table`；`IcebergCatalog._inner`（有 warehouse）、`PostgresCatalog`（**只有连接串**） | `daft/catalog/__iceberg.py:49-66`、`__postgres.py:38` | 未声明属于哪一族（location-backed / DB-backed / 纯注册表） |
+
+**落到接口上的三处修改（相对 v2）**
+
+1. **`TableRef` 增加可选字段**，让"要不要 FS"由数据决定而不是由调用方猜：
+
+```python
+@dataclass(frozen=True)
+class TableRef:
+    schema: Schema
+    location: Location | None = None        # 仅 location-backed 表非空（fs scheme + path + io_config）
+    file_format: str | None = None          # "parquet" / "csv" / …
+    table_protocol: str | None = None       # "iceberg" / "delta" / "hive" / None
+    scan: ScanSpec | None = None            # DB-backed 直接给 DB 扫描（无 location/格式）
+    # 层链：谁参与了这次解析，便于 explain() 与错误信息
+    layers: tuple[Literal["catalog","table_format","file_format","filesystem"], ...] = ()
+```
+
+2. **能力不再是"通用 meet"，而是"只对参与该表的层求 meet"**：
+
+| 表 | 参与的层 | 有效能力 |
+|---|---|---|
+| ClickHouse 表 | catalog(DB) | 由 DB 驱动声明（并发写、事务、无文件语义） |
+| Hive/Iceberg 表 | catalog(warehouse) → L2 → L1 → L0 | 快照/分区裁剪 ∩ Parquet 下推 ∩ S3 range GET |
+| `s3://b/x.parquet` | L1 → L0 | Parquet 能力 ∩ S3 传输能力 |
+| 内存表（`TableSource::View`） | catalog(纯注册表) | 无 IO 能力，只有命名 |
+
+3. **写路径按"谁拥有文件"分派**（对应你说的"DB 交给数据库自己写入文件"）：
+
+| 场景 | 谁写文件 | `SinkSpec` 形态 | 需要 location 吗 |
+|---|---|---|---|
+| `write_parquet("s3://…")` | Daft（`daft-writers`） | `NativeTabularSink` | **需要**（显式给出） |
+| Hive / 数据湖表写入 | Daft 写文件 + 元数据提交 | `CatalogSink` | **需要**（由 catalog 的 warehouse/LOCATION 提供） |
+| `write_clickhouse(...)` / `write_sql(...)` | **数据库**（Daft 只交数据） | `PythonDataSink` | **不需要**，且不应暴露格式/路径参数 |
+| `write_sink(my_sink)` | 用户自定义 | `PythonDataSink` | 由 sink 自己决定 |
+
+**这也是一个 UX 判据**：如果一个 API 让用户为 ClickHouse 指定"格式/路径"，那就是分层泄漏；
+反过来，写 Iceberg 时只给表名不给仓库位置，才应该由 catalog 补上。
 
 ## 4. 统一入口 API（纯新增，不动老入口）
 
@@ -492,6 +563,20 @@ FORMA/STORAGE/LAKE 三类内置 provider 的声明应当**直接来自现有实�
 1. **用户可见**：`daft.storage.dtype_matrix("csv")` / `capabilities` 能提前告诉用户"Csv 不支持谓词下推"，而不是让用户在计划里发现 filter 停在半空；
 2. **开发可见**：新加格式时，能力声明是 checklist，"声明为 true 但实现没做" 会被一致性测试抓住（这是当前 `can_absorb_*` 全 false 却仍能下推这类不一致的根治办法）。
 
+**按 v3 的四层模型补齐"层链"列**（谁参与决定了需要哪些能力声明）：
+
+| 后端族 | 层链 | 需要的声明 |
+|---|---|---|
+| 本地/对象存储（local/s3/oss/hdfs/gcs/az/http/hf） | **L0** | scheme 能力：range GET、multipart、并发上限、重试、protocol_aliases |
+| 文件格式（parquet/csv/json/avro/text/mcap/warc） | **L1 → L0** | 下推能力、统计、切分粒度 |
+| 数据湖（iceberg/delta/hudi/paimon/lance） | **L2 → L1 → L0** | 快照/时间旅行、分区裁剪、提交协议、schema 演进 |
+| Hive / 元数据服务（glue/unity/hms） | **L3(location-backed) → L2? → L1 → L0** | 命名空间、warehouse/LOCATION 解析、凭据下发 |
+| DB（postgres/clickhouse/mongodb…） | **L3(DB-backed)** | 连接、事务/写入模式、类型映射；**无 FS、无格式** |
+| 内存/生成器（`TableSource::View`、generator、range） | **L3(纯注册表)** | 只有命名与 schema |
+
+> 一句话判据：**一条后端链上"是否出现 L0/L1"由数据源本身决定，不由 API 决定。**
+> 出现"给 DB 指定文件格式"或"给 Iceberg 指定 parquet 压缩"这类要求时，先检查是不是分层泄漏。
+
 **迁移三步（内置后端）**
 
 | 步 | 动作 | 风险 |
@@ -543,14 +628,22 @@ FORMA/STORAGE/LAKE 三类内置 provider 的声明应当**直接来自现有实�
 
 一句话总结这套设计：**把"存储 × 格式 × 命名"三个正交轴用 `Provider` 组装成后端，把"能力"和"类型映射"从实现里提到声明里，把"统一"做成加法而不是替换。**
 
-**v2 之后的完整心智模型**（推荐放在文档首页给用户看）：
+**v3 之后的完整心智模型**（推荐放在文档首页给用户看）：
 
 ```
-读：  URI ─► STORAGE(scheme) ─► FORMAT(显式/扩展名) ─► scan() ─► DataFrame
-     名字 ─► TABLE(catalog) ──────────────────────────► Table.read() ─► DataFrame
-写：  df ─► SinkSpec ─┬─ NativeTabularSink → write_tabular → SinkInfo::OutputFileInfo（Parquet/CSV/JSON/Avro）
-                     ├─ CatalogSink       → SinkInfo::CatalogInfo（Iceberg/Delta/Paimon/Lance）
-                     └─ PythonDataSink    → write_sink → SinkInfo::DataSinkInfo（ClickHouse/Bigtable/…）
+L3 Catalog（命名）  catalog > schema > table
+     ├─ location-backed（Hive/Iceberg/Paimon/Glue/Unity）──► 需要 L0/L1/L2
+     ├─ DB-backed（Postgres/ClickHouse/MongoDB）───────────► 到此结束：数据文件由 DB 自己管
+     └─ 纯注册表（View/内存）───────────────────────────────► 到此结束：只有命名与 schema
+
+路径式访问（无 L3）：
+读：  URI ─► L0 Filesystem(scheme) ─► L1 FileFormat(显式/扩展名) ─► scan() ─► DataFrame
+写：  URI ─► L0 + L1 ─► NativeTabularSink ─► write_tabular ─► SinkInfo::OutputFileInfo
+
+写完分派（谁拥有文件）：
+写：  df ─► SinkSpec ─┬─ NativeTabularSink（Daft 写文件，需 location）
+                     ├─ CatalogSink       （Daft 写文件 + 表协议提交，location 来自 catalog）
+                     └─ PythonDataSink    （DB 自己写文件，Daft 只交数据；无 location/格式参数）
 ```
 
 ---
@@ -577,3 +670,4 @@ FORMA/STORAGE/LAKE 三类内置 provider 的声明应当**直接来自现有实�
 |---|---|
 | v1 | 初版：Provider/Capabilities/TypeMapping/Handle + 单一 scheme 注册表；`sink()` 返回 `DataSink` |
 | **v2** | 修正为**双轴模型**（STORAGE × FORMAT + LAKE/TABLE/VIRTUAL），新增 `SinkSpec` 三种写形态、内置后端能力矩阵（§7.6）、能力 meet 组合规则、URI 解析规则；P1 改为"用内置文件后端验证双轴模型" |
+| **v3** | 再把"双轴"收敛为**四层模型**（§3.7）：L0 Filesystem / L1 FileFormat / L2 TableFormat / L3 Catalog，四者**相互独立**；`location` 改为**可选字段**，只有 location-backed 的 catalog 才向下拉 L0/L1/L2；DB-backed 与纯注册表在 L3 终止；写路径按"谁拥有文件"分派（Daft 写 vs DB 写）；`TableRef` 增加 `location/file_format/table_protocol/layers` |

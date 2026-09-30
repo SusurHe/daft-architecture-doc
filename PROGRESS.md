@@ -13,7 +13,8 @@
 | **P1-b** | 内置读入口（parquet/csv/json/avro/text）改为 `STORAGE × FORMAT` 两次解析 | ⏳ 待做 | — |
 | **P1-c** | 内置写入口改为 `handle.sink()` → `NativeTabularSink` | ⏳ 待做 | — |
 | **P2** | 数据湖 provider：Iceberg 复用 parquet 的 FORMAT 实现 + 自身元数据逻辑 | ⏳ 待做 | — |
-| **P3** | 数据库 provider（ClickHouse/MongoDB）、修 `PostgresCatalog.append` 的内联 COPY、提交协议接入执行层 | ⏳ 待做 | — |
+| **P3-a** | ClickHouse provider（读 `read_sql` / 写既有 sink / `APPEND_ONLY` 声明）+ DB 类 URI 在 L3 终止 | ✅ 完成 | `32c76b3b`；66 用例 |
+| **P3-b** | MongoDB provider、修 `PostgresCatalog.append` 的内联 COPY、`DataWriter/Committer` 接入执行层 | ⏳ 待做 | — |
 | **P4** | 收敛：新后端只接受 provider 形式、`write_*` 弃用、能力矩阵文档自动化 | ⏳ 待做 | — |
 
 图例：✅ 完成 · 🔄 进行中 · ⏳ 待做 · ⚠️ 部分实现
@@ -77,6 +78,38 @@ ruff check daft/storage tests/storage      # All checks passed
 ```
 
 **说明**：`daft/__init__.py:16` 存在一条**既有** `BLIND-EXCEPT` 告警（对改动前的版本执行同一检查同样报出），不在本阶段范围内，未做修改以免扩大 PR 差异。
+
+### P3-a · ClickHouse provider 与 DB 类后端的分层（完成）
+
+**提交**：`32c76b3b` — `feat(storage): add the ClickHouse provider and let database URIs resolve at the catalog layer`
+
+**变更**
+
+- `daft/storage/registry.py`：注册为 `DATABASE` / `TABLE_FORMAT` 的 scheme **直接在 L3 终止**（无文件系统、无格式、`location_source=NONE`）；`ResolvedSource` 增加可选 `direct_provider` 与可空 `format_name`/`storage_key`/`location`；
+- `daft/storage/handle.py`：provider 选择改为按协议（`_provider_for`），使单个数据库 provider 同时承载 scan 与 sink；`describe()` 支持"无 location"；
+- `daft/io/clickhouse/provider.py`（新增）：`ClickHouseProvider`（`DATABASE`、`APPEND_ONLY`、类型映射三态）+ `read_clickhouse()` / `write_clickhouse()` 便捷入口 + URI 解析（host/port/user/password/database/table，选项覆盖 URI）；
+- `daft/io/clickhouse/__init__.py`：改为惰性导入驱动（`__getattr__`），使 provider 注册**不依赖** `clickhouse-connect` 是否安装；公开名 `ClickHouseDataSink` 保持不变；
+- `daft/storage/providers.py`：注册 ClickHouse provider。
+
+**设计验证**：这次改动顺带证伪了 v3 的一处早期写法——DB 类后端**不该走"格式轴"解析**（`clickhouse://host/db/table` 没有扩展名，旧逻辑会抛 `AmbiguousFormatError`）。四层模型的"DB 类在 L3 终止"由此从文档变成代码约束。
+
+**验证**
+
+```bash
+pytest tests/storage -q                    # 66 passed（新增 16 例）
+ruff check daft/storage daft/io/clickhouse tests/storage   # All checks passed
+ruff format --check ...                    # 全绿
+```
+
+**过程中发现并修复的缺陷**
+
+| # | 问题 | 影响 | 修复 |
+|---|---|---|---|
+| 4 | `parse_uri` 把 `user:pass@host:8123` 当成路径 | 表名解析成 `user:pass@host:8123.analytics.events` | 新增 `parse_target()`，用 `urlsplit` 分离 authority 与 path |
+| 5 | sink 构造缺 `host` 参数 | 即使 URI 里带 host 也会 `TypeError` | 从 URI 解析连接参数，选项优先，并在导入可选驱动**之前**校验 |
+| 6 | 表名与 database 重复限定 | `insert_df(table="analytics.events", database="analytics")` 语义不确定 | sink 传裸表名 + database；SQL 查询侧才用 `database.table` |
+| 7 | 缺省依赖提示测试与实现冲突 | 注册 ClickHouse 后旧用例仍断言"未注册" | 该用例改用仍未注册的 `iceberg://` scheme |
+
 
 ---
 

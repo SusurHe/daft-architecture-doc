@@ -952,7 +952,8 @@ class UnsupportedOperationError(DaftError):
 | 现有读入口改为双轴解析 | ⏳ P1-b | — | 需本机可构建 Rust 扩展后用 `tests/io/**` 做逐字对拍 |
 | 现有写入口改为 `handle.sink()` | ⏳ P1-c | — | 同上 |
 | 数据湖 provider 复用 FORMAT provider | ⏳ P2 | — | — |
-| ClickHouse/MongoDB provider、修 Postgres catalog 内联实现 | ⏳ P3 | — | — |
+| ClickHouse provider（读 `read_sql` / 写既有 sink / `APPEND_ONLY`） | ✅ P3-a | `daft/io/clickhouse/provider.py`、`registry.py:resolve_uri`（DB 类在 L3 终止） | `tests/storage/test_clickhouse_provider.py`（16 例） |
+| MongoDB provider、修 Postgres catalog 内联实现 | ⏳ P3-b | — | — |
 | catalog「单一实现原则」的机器校验 | ⏳ P3 | — | 计划：一致性套件断言 `Table.append` 期间调用了 `provider.sink` |
 
 **当前可用能力**（P0 + P1-a 完成后）：
@@ -980,4 +981,5 @@ print(h.plan(ScanRequest(filters=[col("a") > 1], limit=10)).describe())
 | **v3** | 再把"双轴"收敛为**四层模型**（§3.7）：L0 Filesystem / L1 FileFormat / L2 TableFormat / L3 Catalog，四者**相互独立**；`location` 改为**可选字段**，只有 location-backed 的 catalog 才向下拉 L0/L1/L2；DB-backed 与纯注册表在 L3 终止；写路径按"谁拥有文件"分派（Daft 写 vs DB 写）；`TableRef` 增加 `location/file_format/table_protocol/layers` |
 | **v3.1** | 补充 §3.7.1：区分"**表需要 location**"与"**用户需要指定 location**"——`location_source` 三态（USER / CATALOG / NONE），并用 Iceberg 的两种接入（`StaticTable.from_metadata` vs pyiceberg `load_catalog`）作为实证；新增**凭据来源优先级**（显式 IOConfig > catalog 下发 > 环境链），依据 `read_iceberg` 文档字符串 |
 | **v4** | 对照 **Spark DataSource V2** 与 **Flink Connector** 做系统评估（§11）：吸收两层能力模型（`TableCapability` + `Supports*` mixin）、**协商返回残余**协议、`TableRef→ScanBuilder→Scan→Batch` 四段式、**写侧三段式提交协议**（`DataWriter/Committer/GlobalCommitter` + `WriteProtocol`）、工厂选项契约（`required/optional/forward_options` + 未知选项报错）、`V1_FALLBACK` 兜底、统计与分区上报、元数据列、错误分类；并明确列出**不吸收**的六项（DSv2 表达式体系、changelog 流式语义、watermark、StagedTable、enrichment options、算子级下推）；P0 扩容以容纳协商协议与选项契约 |
+| **v4.2** | P3-a 落地：ClickHouse provider（`DATABASE` + `APPEND_ONLY` + 三态类型映射）、DB 类 URI 在 L3 终止（`resolve_uri` 不再要求格式轴）、`handle` 改为按协议选 provider；期间发现并修复 4 个缺陷（URI authority 解析、sink 连接参数、表名限定、依赖提示用例） |
 | **v4.1** | 增加 §12「实现状态」：把设计条目映射到已实现的模块与测试（P0 完成、P1-a 完成，P1-b/c、P2、P3 待做），并链接 `PROGRESS.md` 与 fork 分支；代码侧新增 `daft/storage/` 契约层与 `daft.open` 导出 |

@@ -621,7 +621,7 @@ FORMA/STORAGE/LAKE 三类内置 provider 的声明应当**直接来自现有实�
 
 | 阶段 | 内容 | 破坏性 | 测试 |
 |---|---|---|---|
-| **P0**（~1 周） | 新增 `daft/storage/`（Provider/Capabilities/TypeMapping/SinkSpec/Registry/Handle）+ `daft.open()` + `list_providers()`；注册 **STORAGE 与 FORMAT 两类内置 provider 的声明**（含 §7.6 能力矩阵），**不改任何老入口实现** | 无（纯新增） | 单测：双轴解析、扩展名推断与"无法推断则报错"、注册冲突、`daft.open` 解析 |
+| **P0**（~1 周） | 新增 `daft/storage/`（Provider/Capabilities/TypeMapping/SinkSpec/Registry/Handle）+ `daft.open()` + `list_providers()`；注册 **STORAGE 与 FORMAT 两类内置 provider 的声明**（含 §7.6 能力矩阵），**不改任何老入口实现**。**v4 扩容**：把协商协议（`Residual`）、选项契约、`V1_FALLBACK` 标记一并定型（见 §11.11） | 无（纯新增） | 单测：双轴解析、扩展名推断与"无法推断则报错"、注册冲突、`daft.open` 解析、**未知选项报错与拼写建议**、协商残余语义 |
 | **P1**（~1–2 周） | **先用内置文件后端验证双轴模型**：`read_parquet/csv/json/avro/text` 改为 `STORAGE × FORMAT` 两次解析（行为逐字等价），`write_parquet/csv/json/avro` 产出 `NativeTabularSink` | 无 | 直接复用现有 `tests/io/**` 作等价性护栏；断言计划形状不变 |
 | **P2**（~2 周） | **数据湖 provider**：Iceberg 试点（`LAKE` 复用 `FORMAT("parquet")` 的 scan + 自身快照/分区裁剪），随后 Delta/Hudi/Paimon/Lance | 无 API 变更 | 与现有 `tests/io/iceberg/**` 对照；断言字段 ID 映射与分区裁剪行为不变 |
 | **P3**（~2 周） | **数据库 provider**：ClickHouse 完整落地（`PythonDataSink` 形态 + `read_clickhouse` 别名 + dtype 预检）；修 Postgres catalog 内联实现（改走 `write_sql`） | 无 API 变更；行为改善（PG 写入由单节点串行变为可分布式） | conformance kit + 入口一致性断言 + dtype 矩阵 |
@@ -680,6 +680,239 @@ L3 Catalog（命名）  catalog > schema > table
 
 ---
 
+## 11. 对照 Spark DataSource V2 与 Flink Connector：评估与吸收（v4）
+
+### 11.0 评估速览：v3.1 的缺口，以及谁已经解决过
+
+| v3.1 的做法 | 缺口 | 工业界解法 | 是否吸收 |
+|---|---|---|---|
+| 单个 `Capabilities` dataclass 同时承担"规划信号"和"协商结果" | 语义混淆：静态声明无法表达"这次实际推下去多少" | Spark：粗粒度 `Table.capabilities()` + 细粒度 `Supports*` mixin 两层 | ✅ §11.1 |
+| `pushdown_filters: bool` 等布尔声明 | 声明与实现容易不一致（Daft 现状：`can_absorb_*` 全 false 却仍能下推） | Spark `pushFilters` 返回未处理 filter；Flink `FilterPushdownResult(accepted, remaining)` | ✅ §11.2（**Daft 内部已有同款**） |
+| Provider 直接产出 scan/sink | 元数据与协商状态混在一起 | Spark：`Table` → `ScanBuilder` → `Scan` → `Batch` 四段 | ✅ §11.3 |
+| `DataSink.start/write/finalize` | **没有 commit 阶段**——只有并行写 + driver 聚合 | Flink SinkV2：`SinkWriter` / `Committer` / `GlobalCommitter` 三段式 | ✅ §11.4（最大借鉴项） |
+| `**options` 全收 | 拼写错误被静默吞掉（`write_clickhouse(hostt=…)` 今天不报错） | Flink：`requiredOptions/optionalOptions/forwardOptions` + 未知选项报错 | ✅ §11.5 |
+| "所有后端都要迁到 provider" | 迁移成本高、风险大 | Spark：`TableCapability.V1_FALLBACK` 显式共存 | ✅ §11.6 |
+| `capabilities.statistics: bool` | 只有"能不能"，没有"报什么" | Spark `SupportsReportStatistics`/`SupportsReportPartitioning`；Flink `SupportsStatisticReport` | ✅ §11.7 |
+| 未涉及元数据列/hive 分区列 | Daft 已有 `generated_fields`/`file_path_column`，但未契约化 | Spark `SupportsMetadataColumns`；Flink `SupportsReadingMetadata` | ✅ §11.8 |
+| 零散异常 | 用户不知道怎么绕过 | Spark `unsupportedOperation` + 明确列出替代操作 | ✅ §11.9 |
+
+### 11.1 两层能力模型（吸收 Spark 的 `TableCapability` + `Supports*` mixin）
+
+问题：v3.1 用同一个 `Capabilities` 对象回答两个不同的问题——"**能不能规划这类查询**"（规划期、粗粒度、决定快速失败）与"**这次实际推下去多少**"（协商期、细粒度、返回残余）。Spark 用两层解决：
+
+```python
+class TableCapability(Enum):        # 粗粒度：规划信号 + 快速失败
+    BATCH_READ; BATCH_WRITE; STREAMING_READ; STREAMING_WRITE
+    ACCEPT_ANY_SCHEMA; TRUNCATE; V1_FALLBACK
+
+# 细粒度：能力 mixin，按需实现（未实现即不支持，不靠布尔声明）
+class SupportsPushdownFilters(Protocol):   def push_filters(self, f: list[Expr]) -> Residual[Expr]: ...
+class SupportsPushdownProjection(Protocol):def push_projection(self, cols: list[str]) -> None: ...
+class SupportsPushdownLimit(Protocol):     def push_limit(self, n: int) -> bool: ...
+class SupportsPushdownAggregates(Protocol):def push_aggregation(self, agg: Expr) -> bool: ...
+class SupportsReportStatistics(Protocol):  def report_statistics(self) -> TableStatistics | None: ...
+class SupportsReportPartitioning(Protocol):def report_partitioning(self) -> Partitioning | None: ...
+class SupportsMetadataColumns(Protocol):   def metadata_columns(self) -> list[MetadataColumn]: ...
+```
+
+**规则**：`Capabilities` 只保留"决策与报错需要的少数几个字段"（§附录），其余全部改为 mixin；**未实现某个 mixin = 不支持**，`isinstance(provider, SupportsX)` 就是能力判定，不需要维护两份事实。
+
+### 11.2 协商协议：返回**残余**（吸收 Spark / Flink，并推广 Daft 已有做法）
+
+Spark 的 `ScanBuilder` 文档明确规定了下推顺序：**sample → filter → aggregate → limit/topN → offset → 列裁剪**；每个 `SupportsPushDownX` 负责"接受一部分、把剩下的还回去"。Flink 同构：`applyFilters(...) -> FilterPushdownResult(accepted, remaining)`。
+
+**关键发现：Daft 内部早就是这个协议**，只是只用于 filter：
+
+```rust
+// src/daft-scan/src/pushdowns.rs:10-13
+pub trait SupportsPushdownFilters {
+    /// Applies filters to the scan operator and returns the pushable filters and the remaining filters.
+    fn push_filters(&self, filter: &[ExprRef]) -> (Vec<ExprRef>, Vec<ExprRef>);
+}
+```
+
+配合 `PredicateGroups` 的三路拆分（`src/daft-scan/src/expr_rewriter.rs:56-67`：`partition_only_filter` / `data_only_filter` / `needing_filter_op`），以及 `ScanOperator::as_pushdown_filter()`（`src/daft-scan/src/scan_operator.rs:67-69`）这个暴露口。
+
+**v4 吸收方式**：把这一套从"filter 专有"提升为**所有下推的统一契约**，并规定协商顺序：
+
+```python
+@dataclass
+class Residual(Generic[T]):
+    accepted: list[T]      # 已由后端承担
+    remaining: list[T]     # 必须由上层重新求值（正确性由引擎兜底）
+
+class ScanBuilder(Protocol):
+    def push_sample(self, spec) -> Residual: ...
+    def push_filters(self, filters: list[Expr]) -> Residual[Expr]: ...
+    def push_aggregation(self, aggs: list[Expr]) -> Residual[Expr]: ...
+    def push_limit(self, n: int, offset: int) -> Residual: ...
+    def prune_columns(self, required: list[str]) -> None: ...
+    def build(self) -> "Scan": ...
+```
+
+`can_absorb_*` 退化为"**预筛选提示**"（优化器可据此早停），而**事实来源是协商返回的残余**。这一条直接消灭 §3.6 末尾那个"声明 false 却能下推"的不一致——因为声明不再是事实来源。
+
+### 11.3 四段式构建：TableRef → ScanBuilder → Scan → Batch（吸收 Spark）
+
+Spark 的分段（`Table` 不可变元数据 → `newScanBuilder(options)` 可变协商 → `build()` → `Scan.toBatch()` → `Batch.planInputPartitions()` + `createReaderFactory()`）解决两个问题：元数据可缓存/可序列化不被协商污染；同一张表可以被多次以不同列集合扫描。
+
+v4 对齐：
+
+| 段 | 职责 | Daft 现有映射 |
+|---|---|---|
+| `TableRef` | 不可变元数据：schema / location / file_format / table_protocol / layers / location_source | 新增（v3 已定义字段） |
+| `ScanBuilder` | 协商下推、列裁剪、切分策略（scan task 大小） | 现散落在 `PushDownFilter/Projection/Limit` + `ScanOperator::to_scan_tasks` |
+| `Scan` | 物理计划片段：要读哪些文件/行组、谓词、列 | `Pushdowns` + `ScanTask`（`src/daft-scan/src/lib.rs`） |
+| `Batch` | 每分区读取器 | `ScanTaskSource` + `read_scan_task` |
+
+### 11.4 写侧三段式提交协议（**Flink SinkV2 的最大借鉴**）
+
+Flink 把"写"拆成三个角色：`SinkWriter`（每个并行子任务写，产出 `Committable`）→ `Committer`（每个子任务在 checkpoint 时提交）→ `GlobalCommitter`（全局合并与提交）。Daft 现状只有：
+
+```python
+class DataSink:                     # daft/io/sink.py:31-75
+    def start(self) -> None: ...     # driver
+    def write(self, mps) -> Iterator[WriteResult]: ...   # worker 并行
+    def finalize(self, results) -> MicroPartition: ...   # driver 聚合统计
+```
+
+**缺的正是中间那一段**：没有"提交"这个独立阶段。这解释了 Postgres catalog 为什么退化成单节点串行 `COPY`（`__postgres.py:660-690`）——因为没有 committer 抽象，驱动端只能自己串行写。
+
+v4 引入：
+
+```python
+class WriteProtocol(Enum):
+    APPEND_ONLY       # 失败后重试可能重复（要求用户接受或后端幂等）
+    ATOMIC_COMMIT     # 有原子提交点（文件成功标记 / 快照提交）
+    TWO_PHASE         # 支持 prepare/commit/abort
+    IDEMPOTENT_UPSERT # 以主键去重
+
+class DataWriter(Protocol):          # worker 侧，可并行
+    def write(self, mp: MicroPartition) -> None: ...
+    def prepare_commit(self) -> Committable: ...
+    def abort(self) -> None: ...
+
+class Committer(Protocol):           # 每个 task / 分区
+    def commit(self, cs: list[Committable]) -> list[Committable]: ...
+
+class GlobalCommitter(Protocol):     # driver 侧
+    def combine(self, cs: list[Committable]) -> list[Committable]: ...
+    def commit(self, cs: list[Committable]) -> None: ...
+    def abort(self, cs: list[Committable]) -> None: ...
+```
+
+**与 Daft 既有写路径的对应关系**（不需要新引擎，只是把隐含语义显式化）：
+
+| 现有写路径 | 隐含协议 | 显式化后应声明 |
+|---|---|---|
+| `write_parquet`（`SinkInfo::OutputFileInfo`） | 文件写完 + `_SUCCESS` 标记 | `ATOMIC_COMMIT` |
+| Iceberg / Delta / Paimon（`SinkInfo::CatalogInfo`） | 快照/事务日志提交 | `ATOMIC_COMMIT`（或 `TWO_PHASE` 若支持） |
+| ClickHouse（`insert_df`） | 直接追加，无事务 | `APPEND_ONLY`（若带 token 则 `IDEMPOTENT_UPSERT`） |
+| `write_sql`（SQLAlchemy `to_sql`） | 每 micropartition 一次 `commit()` | `APPEND_ONLY` |
+| Postgres catalog 的 `COPY`（现状） | 单节点串行 | **应被替换**：改为 writer+committer 两段 |
+
+声明 `WriteProtocol` 的收益是**自动生成正确行为**：`APPEND_ONLY` 的重试语义必须提示用户可能重复；`ATOMIC_COMMIT` 失败后必须 abort 清理；`TWO_PHASE` 才允许在 distributed 上做 exactly-once 承诺。
+
+### 11.5 工厂与选项契约（吸收 Flink，顺带修掉一个真实 UX bug）
+
+Flink 的 `DynamicTableFactory` 要求工厂声明 `factoryIdentifier()` / `requiredOptions()` / `optionalOptions()` / `forwardOptions()`，未知选项报错；并区分"影响拓扑的选项"与"可恢复时覆盖的选项（enrichment）"。
+
+Daft 现状：`**options` 全收，`write_clickhouse(hostt="…")` 这类拼写错误**静默失效**——这是今天就能修的实际问题。
+
+v4 吸收（并做减法：不引入 Flink 的 enrichment 概念，只保留 `forward_options`）：
+
+```python
+class Provider(Protocol):
+    @classmethod
+    def required_options(cls) -> list[Option]: ...     # 缺失即报错
+    @classmethod
+    def optional_options(cls) -> list[Option]: ...     # 声明即校验类型/枚举
+    @classmethod
+    def forward_options(cls) -> list[Option]: ...      # 透传给底层客户端，不做校验
+```
+
+未知选项的报错要带**拼写建议**与**合法选项清单**（`did you mean host?`），错误文本由引擎统一生成。
+
+### 11.6 V1 兜底：不强制全量迁移（吸收 Spark `V1_FALLBACK`）
+
+```python
+class ApiLevel(Enum): V2 = "v2"; V1_FALLBACK = "v1"
+```
+
+`DataSource` / `ScanOperator` / `DataSink` 作为 **V1 路径永久可用**；providers 可声明自己是 `V2`（走新协商协议）或 `V1_FALLBACK`（引擎自动降级到老路径并记录一条 plan hint）。这条让第三方与内置大后端可以**分批迁移**，也让"零破坏"从口号变成机制。
+
+### 11.7 统计与分区上报（吸收 Spark/Flink）
+
+```python
+class SupportsReportStatistics(Protocol):
+    def report_statistics(self) -> TableStatistics | None: ...   # rowCount / sizeInBytes / 列级区间
+class SupportsReportPartitioning(Protocol):
+    def report_partitioning(self) -> Partitioning | None: ...     # clustered(keys) / sorted(keys) / unknown
+```
+
+价值：`report_statistics()` 正好喂给 Daft 的 `ApproxStats`（`src/daft-logical-plan/src/stats.rs:105-111`），让 Join 策略与分区数决策拿到**来源侧**而非估算的数字；`report_partitioning()` 则直接服务 `can_skip_hash_repartition`（`pipeline_node/translate.rs:96-118`）——源数据已经按 join key 聚簇时跳过一次 shuffle。Daft 已有 `ScanOperator::statistics()`（`scan_operator.rs:51-57`），这一步是把它契约化并补上分区上报。
+
+### 11.8 元数据列与生成列（吸收 Spark `SupportsMetadataColumns` / Flink `SupportsReadingMetadata`）
+
+Daft 已有三样东西但没契约化：`ScanOperator::generated_fields()`、`file_path_column`、Hive 分区字段（`src/daft-scan/src/glob.rs:518-525`）。
+
+```python
+@dataclass
+class MetadataColumn:
+    name: str
+    dtype: DataType
+    readable: bool = True
+    cost: Literal["free", "cheap", "expensive"] = "free"   # 文件路径列=free，行号列=expensive
+```
+
+`cost` 是 Daft 特有的补充：它让优化器知道"加一个元数据列"是否值得（Spark/Flink 没有这个概念，因为它们不做多模态与 IO 成本建模）。
+
+### 11.9 错误分类（吸收 Spark `unsupportedOperation`）
+
+```python
+class UnsupportedOperationError(DaftError):
+    op: str                                   # "overwrite" / "read_streaming" / "push_filter"
+    provider: str
+    reason: str
+    alternatives: list[str]                   # 必须非空：可替代的 API 或操作路径
+```
+
+承接 §6.2 的"可行动报错"：错误对象化之后，CLI/Python/计划 hint 三处可以复用同一份替代建议。
+
+### 11.10 明确**不吸收**的部分（避免盲目照抄）
+
+| 机制 | 不吸收的理由 |
+|---|---|
+| Spark DSv2 的表达式体系（`Filter`/`Expression`/`SupportsPushDownV2Filters`） | Daft 已有 `Expr` + Arrow 内核 + `PredicateGroups`；再引入一套 IR 只会多一层翻译与语义漂移 |
+| Flink 的 changelog/upsert 流式表语义（`ChangelogMode`、`DynamicTableSink` upsert） | Daft 的流式能力是 Kafka source 级的，不是变更日志表模型；引入会牵动整个执行层与状态管理 |
+| Flink 的 watermark / computed column pushdown | 与 Daft 定位（批式多模态 ETL + AI 推理）无关 |
+| Spark 的 `StagedTable`（两阶段 DDL） | Daft 的 catalog DDL 面仍小（`CREATE TABLE` 等），收益低于复杂度 |
+| Flink 的 enrichment options（作业恢复时覆盖选项） | Daft 无长跑作业恢复语义；`forward_options` 已覆盖"不影响能力的透传"这一需求 |
+| Spark 的 `SupportsPushDownVariantExtractions` 等新算子级下推 | 交给 Daft 优化器规则处理（`push_down_*` 系列），不进入 provider 契约 |
+
+### 11.11 对落地阶段的影响（P0 扩容）
+
+**协商协议、选项契约、V1 标记必须在 P0 定型**——它们是 API 形状，晚改的代价远大于实现成本。更新后的 P0：
+
+| P0 交付物 | 说明 |
+|---|---|
+| `daft/storage/` 骨架 | `TableCapability`（粗）+ `Supports*` mixin（细）+ `Residual` |
+| `ScanBuilder` / `Scan` / `Batch` 三段接口 | 先只接内置 parquet/csv（V1_FALLBACK 兜底其余后端） |
+| `WriteProtocol` + `DataWriter/Committer/GlobalCommitter` | 先只声明不启用（内置 writer 标注 `ATOMIC_COMMIT`） |
+| 选项契约 | `required/optional/forward_options` + 未知选项报错（可独立合并，收益立刻可见） |
+| `daft.open()` / `list_providers()` / `describe(uri)` | 自省入口 |
+| V1 兜底 | `ApiLevel.V1_FALLBACK` + plan hint |
+
+### 11.12 相对 v3.1 的净收益
+
+1. **能力不再靠"声明+信任"**，而是靠"协商+返回残余"——声明与实现不可能再漂移；
+2. **写路径补齐 commit 阶段**，直接给出 Postgres catalog 那类问题的结构性修法（而不是打补丁）；
+3. **迁移风险显著下降**：V1 兜底让内置后端与第三方可以分批走；
+4. **错误与选项质量提升**：未知选项报错 + 可行动替代建议，是用户立刻能感知的改进；
+5. **优化器拿到更多真实信息**：统计与分区上报直接服务 Join 策略、shuffle 跳过与分区数决策。
+
+---
+
 ## 附：能力字段最小集（建议 v1 冻结这些）
 
 ```
@@ -704,3 +937,4 @@ L3 Catalog（命名）  catalog > schema > table
 | **v2** | 修正为**双轴模型**（STORAGE × FORMAT + LAKE/TABLE/VIRTUAL），新增 `SinkSpec` 三种写形态、内置后端能力矩阵（§7.6）、能力 meet 组合规则、URI 解析规则；P1 改为"用内置文件后端验证双轴模型" |
 | **v3** | 再把"双轴"收敛为**四层模型**（§3.7）：L0 Filesystem / L1 FileFormat / L2 TableFormat / L3 Catalog，四者**相互独立**；`location` 改为**可选字段**，只有 location-backed 的 catalog 才向下拉 L0/L1/L2；DB-backed 与纯注册表在 L3 终止；写路径按"谁拥有文件"分派（Daft 写 vs DB 写）；`TableRef` 增加 `location/file_format/table_protocol/layers` |
 | **v3.1** | 补充 §3.7.1：区分"**表需要 location**"与"**用户需要指定 location**"——`location_source` 三态（USER / CATALOG / NONE），并用 Iceberg 的两种接入（`StaticTable.from_metadata` vs pyiceberg `load_catalog`）作为实证；新增**凭据来源优先级**（显式 IOConfig > catalog 下发 > 环境链），依据 `read_iceberg` 文档字符串 |
+| **v4** | 对照 **Spark DataSource V2** 与 **Flink Connector** 做系统评估（§11）：吸收两层能力模型（`TableCapability` + `Supports*` mixin）、**协商返回残余**协议、`TableRef→ScanBuilder→Scan→Batch` 四段式、**写侧三段式提交协议**（`DataWriter/Committer/GlobalCommitter` + `WriteProtocol`）、工厂选项契约（`required/optional/forward_options` + 未知选项报错）、`V1_FALLBACK` 兜底、统计与分区上报、元数据列、错误分类；并明确列出**不吸收**的六项（DSv2 表达式体系、changelog 流式语义、watermark、StagedTable、enrichment options、算子级下推）；P0 扩容以容纳协商协议与选项契约 |

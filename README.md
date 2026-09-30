@@ -14,6 +14,8 @@
 | [`Daft架构深度剖析.md`](Daft架构深度剖析.md) | 同一内容的 Markdown 源（16 章 + 4 附录，含 Mermaid 图） |
 | [`Daft统一接入口设计.md`](Daft统一接入口设计.md) | 设计提案：零破坏的统一 Provider 抽象（能力声明 + 类型映射 + 注册表），含分阶段落地与一致性测试 |
 | `diagrams/` | 14 张 SVG 插图（分层架构、crate 地图、数据模型、生命周期、优化器、计划改写、Swordfish pipeline、UDF 路径、Flotilla、shuffle、Parquet 读取器、内存与背压、能力全景…） |
+| [`PROGRESS.md`](PROGRESS.md) | **开发进度记录**：阶段状态、每个 commit 的验证方式、发现的问题、环境阻塞与下一步 |
+| [`upstream/`](upstream/) | 上游文案：[PR 描述草稿](upstream/PR_BODY.md)、[issue 草稿](upstream/ISSUE_DRAFT.md) |
 | `research/` | 6 份源码调研笔记（逻辑计划与表达式 / 优化器与物理计划 / Swordfish / Flotilla / 数据模型与多模态 / Python API 与 IO 运行时），所有结论带 `文件:行号` |
 | `svgkit.py` · `diagrams_gen.py` | 插图生成：统一的 SVG 设计系统 + 全部插图定义 |
 | `build_doc.py` | Markdown → HTML 构建：把 `<!-- diagram:ID caption="..." -->` 标记替换为内联 SVG，并生成侧边目录 |

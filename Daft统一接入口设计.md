@@ -929,6 +929,48 @@ class UnsupportedOperationError(DaftError):
 
 ---
 
+## 12. 实现状态（v4.1）
+
+> 跟踪方式：本节与仓库根目录的 [`PROGRESS.md`](PROGRESS.md) 同步维护；代码在 fork 分支
+> `SusurHe/Daft:feat/unified-storage-provider-api`（基线 `dadd8a0b2`）。
+
+| 设计条目 | 状态 | 实现位置 | 验证 |
+|---|---|---|---|
+| 四层模型（L0–L3）与 `location_source` | ✅ P0 | `daft/storage/contracts.py`（`Layer`/`Location`/`TableRef`/`LocationSource`） | `tests/storage/test_registry.py::test_resolve_uri_splits_storage_and_format_axes` |
+| 双轴解析（STORAGE × FORMAT）+ 扩展名推断 | ✅ P0 | `registry.py:parse_uri/infer_format/resolve_uri` | `test_infer_format_uses_extensions`、`test_unknown_extension_raises_ambiguous_format_error` |
+| 注册表 + 第三方入口点发现 + 依赖提示 | ✅ P0 | `registry.py:register/resolve/discover`、入口点组 `daft.storage.providers` | `test_registry_populates_itself_in_a_fresh_interpreter`、`test_known_dependency_hint_is_attached` |
+| 两层能力模型（粗 `TableCapability` + 细 `Supports*` mixin） | ✅ P0 | `contracts.py`、`negotiation.py` | `test_scan_sources_only_advertise_what_they_do` |
+| 协商返回残余（`Residual`） | ✅ P0 | `residual.py`、`negotiation.py:negotiate` | `test_negotiation_never_loses_a_filter` 等 6 例 |
+| 三种写形态 `SinkSpec` | ✅ P0（声明 + 路由） | `contracts.py`、`handle.py:write_with_spec` | `test_sink_spec_uses_the_native_writer`、`test_native_sink_writes_through_the_handle` |
+| `WriteProtocol` 提交语义 | ✅ P0（声明） | `contracts.py:WriteProtocol` | `test_write_protocol_semantics` |
+| 选项契约 + 拼写建议 + 未知选项报错 | ✅ P0 | `options.py` | `test_options_contract.py`（7 例） |
+| `V1_FALLBACK` 兜底 | ✅ P0 | `contracts.py:ApiLevel`、`providers.py:LegacyDataSourceProvider` | `test_v1_fallback_backend_skips_negotiation_and_records_a_hint` |
+| 调试/自省入口 | ✅ P0 | `handle.py:describe/plan`、`registry.py:describe_registry`、`negotiation.py:describe_source`、`dtype_matrix()` | `test_describe_explains_layers_location_and_protocol` |
+| `daft.open` 公开入口 | ✅ P1-a | `daft/__init__.py`（+3 行）、`daft/storage/handle.py:open_uri` | `tests/storage/test_public_api.py`（3 例） |
+| 统计/分区上报、元数据列 | ⚠️ 部分 | mixin 已在 `negotiation.py` 定义；Parquet 源实现 `metadata_columns()` | `describe_source()`/`dtype_matrix()` 可观察；`report_statistics`/`report_partitioning` 待接入 |
+| `DataWriter`/`Committer`/`GlobalCommitter` | ⚠️ 仅协议 | `contracts.py` | 未接入执行层（计划随 P3 的数据库 sink 一起落地） |
+| 现有读入口改为双轴解析 | ⏳ P1-b | — | 需本机可构建 Rust 扩展后用 `tests/io/**` 做逐字对拍 |
+| 现有写入口改为 `handle.sink()` | ⏳ P1-c | — | 同上 |
+| 数据湖 provider 复用 FORMAT provider | ⏳ P2 | — | — |
+| ClickHouse/MongoDB provider、修 Postgres catalog 内联实现 | ⏳ P3 | — | — |
+| catalog「单一实现原则」的机器校验 | ⏳ P3 | — | 计划：一致性套件断言 `Table.append` 期间调用了 `provider.sink` |
+
+**当前可用能力**（P0 + P1-a 完成后）：
+
+```python
+import daft
+from daft import col
+from daft.storage import ScanRequest, describe_uri, dtype_matrix, list_providers
+
+h = daft.open("/data/events.parquet")        # 或 daft.storage.open_uri(...)
+h.provider_info.name                          # 'parquet'
+h.write_protocol                              # WriteProtocol.ATOMIC_COMMIT
+df = h.read(filters=[col("a") > 1], limit=10)
+df.write_parquet ...                          # 或 h.write(df) / df.write_sink(h.sink())
+print(h.describe())                           # 层链、location 来源、能力、上次协商结果
+print(h.plan(ScanRequest(filters=[col("a") > 1], limit=10)).describe())
+```
+
 ## 变更记录
 
 | 版本 | 变更 |
@@ -938,3 +980,4 @@ class UnsupportedOperationError(DaftError):
 | **v3** | 再把"双轴"收敛为**四层模型**（§3.7）：L0 Filesystem / L1 FileFormat / L2 TableFormat / L3 Catalog，四者**相互独立**；`location` 改为**可选字段**，只有 location-backed 的 catalog 才向下拉 L0/L1/L2；DB-backed 与纯注册表在 L3 终止；写路径按"谁拥有文件"分派（Daft 写 vs DB 写）；`TableRef` 增加 `location/file_format/table_protocol/layers` |
 | **v3.1** | 补充 §3.7.1：区分"**表需要 location**"与"**用户需要指定 location**"——`location_source` 三态（USER / CATALOG / NONE），并用 Iceberg 的两种接入（`StaticTable.from_metadata` vs pyiceberg `load_catalog`）作为实证；新增**凭据来源优先级**（显式 IOConfig > catalog 下发 > 环境链），依据 `read_iceberg` 文档字符串 |
 | **v4** | 对照 **Spark DataSource V2** 与 **Flink Connector** 做系统评估（§11）：吸收两层能力模型（`TableCapability` + `Supports*` mixin）、**协商返回残余**协议、`TableRef→ScanBuilder→Scan→Batch` 四段式、**写侧三段式提交协议**（`DataWriter/Committer/GlobalCommitter` + `WriteProtocol`）、工厂选项契约（`required/optional/forward_options` + 未知选项报错）、`V1_FALLBACK` 兜底、统计与分区上报、元数据列、错误分类；并明确列出**不吸收**的六项（DSv2 表达式体系、changelog 流式语义、watermark、StagedTable、enrichment options、算子级下推）；P0 扩容以容纳协商协议与选项契约 |
+| **v4.1** | 增加 §12「实现状态」：把设计条目映射到已实现的模块与测试（P0 完成、P1-a 完成，P1-b/c、P2、P3 待做），并链接 `PROGRESS.md` 与 fork 分支；代码侧新增 `daft/storage/` 契约层与 `daft.open` 导出 |
